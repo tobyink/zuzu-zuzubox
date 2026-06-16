@@ -1,0 +1,8 @@
+#!/usr/bin/env zuzu
+
+from std/proc import Proc;
+from zdf/zuzubox import run_cli;
+
+function __main__ ( argv ) {
+	Proc.exit(run_cli(argv));
+}

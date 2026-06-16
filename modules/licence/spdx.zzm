@@ -1,0 +1,525 @@
+=encoding utf8
+
+=head1 NAME
+
+licence/spdx - SPDX licence expression parsing and licence-list helpers.
+
+=head1 SYNOPSIS
+
+  from licence/spdx import is_spdx_expression, licence_expression_text;
+
+  if ( is_spdx_expression("MIT OR Apache-2.0") ) {
+    say( licence_expression_text("MIT") );
+  }
+
+=head1 DESCRIPTION
+
+C<licence/spdx> parses SPDX licence expressions locally, following the
+SPDX 3.0 licence expression grammar. It can also fetch and parse the SPDX
+C<license-list-data> C<licenses.md> file to validate short identifiers
+and fetch the matching full licence text.
+
+=head1 EXPORTS
+
+=head2 C<normalize_spdx_expression(value)>
+
+Returns a whitespace-normalized SPDX expression if C<value> parses, or
+C<null> otherwise.
+
+=head2 C<validate_spdx_expression(value, options?)>
+
+Returns a result dictionary. Without C<options>, validation checks
+expression syntax. If C<online> is true, or C<licences> and
+C<exceptions> maps are supplied, short identifiers are checked against
+the SPDX licence-list data.
+
+=head2 C<is_spdx_expression(value, options?)>
+
+Boolean wrapper around C<validate_spdx_expression>.
+
+=head2 C<fetch_spdx_licence_list(options?)>
+
+Downloads SPDX C<licenses.md>.
+
+=head2 C<parse_spdx_licence_list(markdown)>
+
+Parses SPDX C<licenses.md> into C<licences>, C<exceptions>, and C<paths>
+dictionaries.
+
+=head2 C<licence_expression_text(expression, options?)>
+
+Fetches full text for every fetchable SPDX licence identifier in an
+expression and concatenates it for a C<LICENCE> file. Returns C<null> if
+the expression is not valid, contains local C<LicenseRef> identifiers, or
+the needed text path is unavailable.
+
+=head1 COPYRIGHT AND LICENCE
+
+B<< licence/spdx >> is copyright Toby Inkster.
+
+It is free software; you may redistribute it and/or modify it under
+the terms of either the Artistic License 1.0 or the GNU General Public
+License version 2.
+
+=cut
+
+from std/io import Path;
+from std/net/http import UserAgent;
+from std/proc import Env;
+from std/string import join, split, starts_with, substr, trim;
+from std/time import Time;
+
+const LICENCE_LIST_URL :=
+	"https://raw.githubusercontent.com/spdx/license-list-data/main/licenses.md";
+const LICENCE_LIST_RAW_BASE :=
+	"https://raw.githubusercontent.com/spdx/license-list-data/main/";
+const DEFAULT_CACHE_SECONDS := 30 * 24 * 60 * 60;
+
+function _opt ( options, key, fallback := null ) {
+	if ( options instanceof Dict and options.exists(key) ) {
+		return options.get(key);
+	}
+	return fallback;
+}
+
+function _compact_space ( value ) {
+	let out := [];
+	for ( let part in split( trim("" _ value), /\s+/ ) ) {
+		out.push(part) if part ne "";
+	}
+	return join( " ", out );
+}
+
+function _now_epoch () {
+	return ( new Time() ).epoch();
+}
+
+function _ensure_dir ( path ) {
+	return true if path.exists();
+	let parent := path.parent();
+	_ensure_dir(parent) if not parent.exists();
+	path.mkdir();
+	return true;
+}
+
+function _cache_root ( options? ) {
+	let explicit := _opt( options, "cache_dir", _opt( options, "cache-dir", null ) );
+	return new Path(explicit) if explicit != null;
+
+	let xdg := Env.get( "XDG_CACHE_HOME", "" );
+	return ( new Path(xdg) ).child("zuzu").child("licence-spdx")
+		if xdg ne "";
+
+	let home := Env.get( "HOME", "" );
+	return ( new Path(home) ).child(".cache").child("zuzu").child("licence-spdx")
+		if home ne "";
+
+	return Path.tempdir().child("zuzu").child("licence-spdx");
+}
+
+function _cache_seconds ( options? ) {
+	return _opt( options, "cache_seconds", _opt( options, "cache-seconds", DEFAULT_CACHE_SECONDS ) );
+}
+
+function _cache_is_fresh ( path, options? ) {
+	return false if _opt( options, "no_cache", _opt( options, "no-cache", false ) );
+	return false if _opt( options, "refresh", false );
+	return false if not path.exists() or not path.is_file();
+	let max_age := _cache_seconds(options);
+	return false if max_age <= 0;
+	return _now_epoch() - path.stat().get( "mtime", 0 ) <= max_age;
+}
+
+function _safe_cache_name ( String path ) {
+	let out := "";
+	let i := 0;
+	while ( i < length path ) {
+		let ch := substr( path, i, 1 );
+		out _= ( ch ~ /^[A-Za-z0-9._+-]$/ ) ? ch : "_";
+		i++;
+	}
+	return out;
+}
+
+function _cached_http_get ( String url, cache_path, options? ) {
+	return cache_path.slurp_utf8() if _cache_is_fresh( cache_path, options );
+
+	let response_urls := _opt( options, "response_urls", null );
+	let response_bodies := _opt( options, "response_bodies", null );
+	let text := null;
+	if ( response_urls != null and response_bodies != null ) {
+		let i := 0;
+		while ( i < response_urls.length() and text == null ) {
+			if ( "" _ response_urls[i] eq url ) {
+				text := "" _ response_bodies[i];
+			}
+			i++;
+		}
+	}
+	if ( text == null ) {
+		let ua := _opt( options, "ua", null );
+		ua := new UserAgent() if ua == null;
+		text := "" _ ua.get(url).expect_success().content();
+	}
+
+	if ( not _opt( options, "no_cache", _opt( options, "no-cache", false ) ) ) {
+		try {
+			_ensure_dir(cache_path.parent());
+			cache_path.spew_utf8(text);
+		}
+		catch {
+			// Cache failures must not make SPDX validation unusable.
+		}
+	}
+
+	return text;
+}
+
+function _tokenize ( String expression ) {
+	let tokens := [];
+	let i := 0;
+	while ( i < length expression ) {
+		let ch := substr( expression, i, 1 );
+		if ( ch ~ /^\s$/ ) {
+			i++;
+			next;
+		}
+		if ( ch eq "(" or ch eq ")" ) {
+			tokens.push(ch);
+			i++;
+			next;
+		}
+		let start := i;
+		while ( i < length expression ) {
+			ch := substr( expression, i, 1 );
+			last if ch ~ /^\s$/ or ch eq "(" or ch eq ")";
+			i++;
+		}
+		tokens.push(substr( expression, start, i - start ));
+	}
+	return tokens;
+}
+
+function _is_licence_ref ( String identifier ) {
+	return true if identifier ~ /^LicenseRef-[A-Za-z0-9.-]+$/;
+	return identifier ~ /^DocumentRef-[A-Za-z0-9.-]+:LicenseRef-[A-Za-z0-9.-]+$/;
+}
+
+function _is_addition_ref ( String identifier ) {
+	return true if identifier ~ /^AdditionRef-[A-Za-z0-9.-]+$/;
+	return identifier ~ /^DocumentRef-[A-Za-z0-9.-]+:AdditionRef-[A-Za-z0-9.-]+$/;
+}
+
+function _is_short_identifier ( String identifier ) {
+	return identifier ~ /^[A-Za-z0-9][A-Za-z0-9.-]*$/;
+}
+
+function _operator ( String token ) {
+	return "AND" if token eq "AND" or token eq "and";
+	return "OR" if token eq "OR" or token eq "or";
+	return "WITH" if token eq "WITH" or token eq "with";
+	return null;
+}
+
+function _push_unique ( Array out, String value ) {
+	for ( let existing in out ) {
+		return false if existing eq value;
+	}
+	out.push(value);
+	return true;
+}
+
+function _parse_licence_token ( tokens, pos, result ) {
+	die "expected licence identifier" if pos >= tokens.length();
+	let token := tokens[pos];
+	die "expected licence identifier" if token eq "(" or token eq ")";
+	die "unexpected operator" if _operator(token) != null;
+
+	let identifier := token;
+	let suffix := "";
+	if ( length identifier > 1 and substr( identifier, length identifier - 1, 1 ) eq "+" ) {
+		identifier := substr( identifier, 0, length identifier - 1 );
+		suffix := "+";
+	}
+
+	die "invalid licence identifier"
+		if not _is_licence_ref(identifier) and not _is_short_identifier(identifier);
+	die "licence-ref cannot use the or-later '+' operator"
+		if suffix ne "" and _is_licence_ref(identifier);
+	_push_unique(result{identifiers}, identifier);
+
+	return {
+		pos: pos + 1,
+		normalized: identifier _ suffix,
+		simple: true,
+	};
+}
+
+function _parse_primary;
+function _parse_with;
+function _parse_and;
+function _parse_or;
+
+function _parse_primary ( tokens, pos, result ) {
+	die "expected expression" if pos >= tokens.length();
+	if ( tokens[pos] eq "(" ) {
+		let inner := _parse_or( tokens, pos + 1, result );
+		die "expected closing parenthesis"
+			if inner{pos} >= tokens.length() or tokens[inner{pos}] ne ")";
+		return {
+			pos: inner{pos} + 1,
+			normalized: "(" _ inner{normalized} _ ")",
+			simple: false,
+		};
+	}
+	return _parse_licence_token( tokens, pos, result );
+}
+
+function _parse_with ( tokens, pos, result ) {
+	let left := _parse_primary( tokens, pos, result );
+	if ( left{pos} < tokens.length() and _operator(tokens[left{pos}]) eq "WITH" ) {
+		die "WITH must follow a simple licence expression"
+			if not left{simple};
+		let exception_pos := left{pos} + 1;
+		die "expected exception identifier" if exception_pos >= tokens.length();
+		let exception := tokens[exception_pos];
+		die "invalid exception identifier"
+			if (
+				not _is_addition_ref(exception)
+				and ( not _is_short_identifier(exception) or exception ~ /\+$/ )
+			);
+		_push_unique(result{exceptions}, exception);
+		return {
+			pos: exception_pos + 1,
+			normalized: left{normalized} _ " WITH " _ exception,
+			simple: false,
+		};
+	}
+	return left;
+}
+
+function _parse_and ( tokens, pos, result ) {
+	let left := _parse_with( tokens, pos, result );
+	while ( left{pos} < tokens.length() and _operator(tokens[left{pos}]) eq "AND" ) {
+		let right := _parse_with( tokens, left{pos} + 1, result );
+		left := {
+			pos: right{pos},
+			normalized: left{normalized} _ " AND " _ right{normalized},
+			simple: false,
+		};
+	}
+	return left;
+}
+
+function _parse_or ( tokens, pos, result ) {
+	let left := _parse_and( tokens, pos, result );
+	while ( left{pos} < tokens.length() and _operator(tokens[left{pos}]) eq "OR" ) {
+		let right := _parse_and( tokens, left{pos} + 1, result );
+		left := {
+			pos: right{pos},
+			normalized: left{normalized} _ " OR " _ right{normalized},
+			simple: false,
+		};
+	}
+	return left;
+}
+
+function fetch_spdx_licence_list ( options? ) {
+	let url := _opt( options, "url", LICENCE_LIST_URL );
+	return _cached_http_get( url, _cache_root(options).child("licences.md"), options );
+}
+
+function parse_spdx_licence_list ( String markdown ) {
+	let licences := {};
+	let exceptions := {};
+	let licence_case := {};
+	let exception_case := {};
+	let paths := {};
+	let section := null;
+
+	for ( let line in split( markdown, "\n" ) ) {
+		if ( starts_with( line, "## Licenses" ) ) {
+			section := "licence";
+			next;
+		}
+		if ( line ~ /^## .*Exceptions/ ) {
+			section := "exception";
+			next;
+		}
+
+		let row := line ~ /^\|.*\|\s*\[([^\]]+)\]\[\]\s*\|/;
+		if ( row ) {
+			if ( section eq "licence" ) {
+				licences.set( row[1], null );
+				licence_case.set( lc(row[1]), row[1] );
+			}
+			if ( section eq "exception" ) {
+				exceptions.set( row[1], null );
+				exception_case.set( lc(row[1]), row[1] );
+			}
+			next;
+		}
+
+		let ref := line ~ /^\[([^\]]+)\]:\s*(\S+)\s*$/;
+		if ( ref ) {
+			paths.set( ref[1], ref[2] );
+		}
+	}
+
+	for ( let identifier in licences.keys() ) {
+		licences.set( identifier, paths.get( identifier, null ) );
+	}
+	for ( let identifier in exceptions.keys() ) {
+		exceptions.set( identifier, paths.get( identifier, null ) );
+	}
+
+	return {
+		licences: licences,
+		exceptions: exceptions,
+		licence_case: licence_case,
+		exception_case: exception_case,
+		paths: paths,
+	};
+}
+
+function spdx_licence_list ( options? ) {
+	if (
+		options instanceof Dict
+		and options.exists("licences")
+		and options.exists("exceptions")
+	) {
+		return {
+			licences: options{licences},
+			exceptions: options{exceptions},
+			licence_case: _opt( options, "licence_case", {} ),
+			exception_case: _opt( options, "exception_case", {} ),
+			paths: _opt( options, "paths", {} ),
+		};
+	}
+	if ( options instanceof Dict and options.exists("markdown") ) {
+		return parse_spdx_licence_list(options{markdown});
+	}
+	return parse_spdx_licence_list(fetch_spdx_licence_list(options));
+}
+
+function _validate_against_list ( result, options ) {
+	let list := null;
+	if (
+		options instanceof Dict
+		and (
+			options.exists("licences")
+			or options.exists("exceptions")
+			or options.exists("markdown")
+			or options.exists("online")
+		)
+	) {
+		list := spdx_licence_list(options);
+	}
+	return true if list == null;
+
+	for ( let identifier in result{identifiers} ) {
+		next if _is_licence_ref(identifier);
+		let canonical := list{licences}.exists(identifier)
+			? identifier
+			: list{licence_case}.get( lc(identifier), null );
+		if ( canonical == null ) {
+			result{ok} := false;
+			result{error} := "unknown SPDX licence identifier: " _ identifier;
+			return false;
+		}
+	}
+	for ( let identifier in result{exceptions} ) {
+		next if _is_addition_ref(identifier);
+		let canonical := list{exceptions}.exists(identifier)
+			? identifier
+			: list{exception_case}.get( lc(identifier), null );
+		if ( canonical == null ) {
+			result{ok} := false;
+			result{error} := "unknown SPDX exception identifier: " _ identifier;
+			return false;
+		}
+	}
+	return true;
+}
+
+function validate_spdx_expression ( value, options? ) {
+	let expression := _compact_space(value);
+	let result := {
+		ok: false,
+		error: null,
+		normalized: null,
+		identifiers: [],
+		exceptions: [],
+	};
+	if ( expression eq "" ) {
+		result{error} := "empty SPDX expression";
+		return result;
+	}
+
+	try {
+		let tokens := _tokenize(expression);
+		let parsed := _parse_or( tokens, 0, result );
+		die "unexpected token: " _ tokens[parsed{pos}]
+			if parsed{pos} != tokens.length();
+		result{ok} := true;
+		result{normalized} := parsed{normalized};
+		_validate_against_list( result, options );
+	}
+	catch ( Exception e ) {
+		result{error} := e{message};
+	}
+	return result;
+}
+
+function normalize_spdx_expression ( value, options? ) {
+	let result := validate_spdx_expression( value, options );
+	return result{ok} ? result{normalized} : null;
+}
+
+function is_spdx_expression ( value, options? ) {
+	return validate_spdx_expression( value, options ){ok} ? true : false;
+}
+
+function _fetch_text_path ( String path, options? ) {
+	let base := _opt( options, "raw-base-url", LICENCE_LIST_RAW_BASE );
+	let cache_path := _cache_root(options)
+		.child("text")
+		.child(_safe_cache_name(path));
+	return _cached_http_get( base _ path, cache_path, options );
+}
+
+function licence_expression_text ( value, options? ) {
+	let list := spdx_licence_list(options);
+	let result := validate_spdx_expression(
+		value,
+		{
+			licences: list{licences},
+			exceptions: list{exceptions},
+			licence_case: list{licence_case},
+			exception_case: list{exception_case},
+			paths: list{paths},
+		},
+	);
+	return null if not result{ok};
+
+	let parts := [
+		"SPDX-License-Identifier: " _ result{normalized} _ "\n",
+	];
+	for ( let identifier in result{identifiers} ) {
+		return null if _is_licence_ref(identifier);
+		let path := list{licences}.get(identifier, null);
+		return null if path == null;
+		parts.push("---- " _ identifier _ " ----\n\n");
+		parts.push(_fetch_text_path( path, options ));
+		parts.push("\n");
+	}
+	for ( let identifier in result{exceptions} ) {
+		return null if _is_addition_ref(identifier);
+		let path := list{exceptions}.get(identifier, null);
+		return null if path == null;
+		parts.push("---- " _ identifier _ " ----\n\n");
+		parts.push(_fetch_text_path( path, options ));
+		parts.push("\n");
+	}
+	return join( "\n", parts );
+}

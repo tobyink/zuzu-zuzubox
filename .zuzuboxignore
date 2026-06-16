@@ -1,0 +1,8 @@
+# Working files which should not be shipped.
+#
+# Patterns are matched against paths relative to the distribution root.
+# Later rules override earlier rules. A leading ! re-includes a path if
+# ZDF-1 would otherwise allow it.
+#
+# scratch/
+# *.bak

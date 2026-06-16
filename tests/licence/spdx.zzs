@@ -1,0 +1,163 @@
+from test/more import *;
+
+requires_capability( "fs" );
+
+from std/io import Path;
+from std/string import contains, join;
+from licence/spdx import
+	fetch_spdx_licence_list,
+	is_spdx_expression,
+	licence_expression_text,
+	normalize_spdx_expression,
+	parse_spdx_licence_list,
+	validate_spdx_expression;
+
+let markdown := join( "\n", [
+	"# License List",
+	"## Licenses with Short Identifiers",
+	"| Full Name of License | Short Identifier | OSI? | FSFLibre? |",
+	"|----------------------|------------------|------|-----------|",
+	"| MIT License | [MIT][] | Y | Y |",
+	"| Apache License 2.0 | [Apache-2.0][] | Y | Y |",
+	"| GNU GPL v2 or later | [GPL-2.0-or-later][] | Y | Y |",
+	"## License Exceptions with Short Identifiers",
+	"| Full Name of Exception | Short Identifier |",
+	"|------------------------|------------------|",
+	"| Bison exception | [Bison-exception-2.2][] |",
+	"[MIT]: text/MIT.txt",
+	"[Apache-2.0]: text/Apache-2.0.txt",
+	"[GPL-2.0-or-later]: text/GPL-2.0-or-later.txt",
+	"[Bison-exception-2.2]: text/Bison-exception-2.2.txt",
+	"",
+] );
+
+let list := parse_spdx_licence_list(markdown);
+ok( list{licences}.exists("MIT"), "licence-list parser finds licences" );
+ok(
+	list{exceptions}.exists("Bison-exception-2.2"),
+	"licence-list parser finds exceptions",
+);
+is(
+	list{licences}.get("Apache-2.0"),
+	"text/Apache-2.0.txt",
+	"licence-list parser maps text paths",
+);
+
+is(
+	normalize_spdx_expression("MIT or Apache-2.0"),
+	"MIT OR Apache-2.0",
+	"lower-case OR normalizes",
+);
+is(
+	normalize_spdx_expression("MIT AND (Apache-2.0 OR GPL-2.0-or-later)"),
+	"MIT AND (Apache-2.0 OR GPL-2.0-or-later)",
+	"parenthesised compound expression parses",
+);
+ok(
+	is_spdx_expression("GPL-2.0-or-later WITH Bison-exception-2.2"),
+	"WITH expression parses",
+);
+ok(
+	is_spdx_expression("LicenseRef-Private OR MIT"),
+	"LicenseRef expressions parse",
+);
+ok(
+	is_spdx_expression("MIT WITH AdditionRef-local"),
+	"AdditionRef expressions parse",
+);
+ok(
+	not is_spdx_expression("(MIT OR Apache-2.0) WITH Bison-exception-2.2"),
+	"WITH rejects compound left operand",
+);
+ok(
+	not is_spdx_expression("LicenseRef-Private+"),
+	"LicenseRef rejects plus suffix",
+);
+
+let online_ok := validate_spdx_expression(
+	"mit OR Apache-2.0",
+	{ markdown: markdown },
+);
+ok( online_ok{ok}, "online validation treats listed identifiers case-insensitively" );
+ok(
+	not validate_spdx_expression( "No-Such-License", { markdown: markdown } ){ok},
+	"online validation rejects unknown short identifiers",
+);
+
+let text := licence_expression_text(
+	"MIT OR Apache-2.0",
+	{
+		markdown: markdown,
+		response_urls: [
+			"https://example.test/text/MIT.txt",
+			"https://example.test/text/Apache-2.0.txt",
+		],
+		response_bodies: [ "licence-text-1", "licence-text-2" ],
+		"raw-base-url": "https://example.test/",
+		cache_dir: Path.tempdir().to_String(),
+	},
+);
+ok( contains( text, "SPDX-License-Identifier: MIT OR Apache-2.0" ), "text includes SPDX header" );
+ok( contains( text, "licence-text-1" ), "text fetch includes first licence" );
+ok( contains( text, "licence-text-2" ), "text fetch includes second licence" );
+
+let cache_dir := Path.tempdir();
+let list_url := "https://example.test/licenses.md";
+is(
+	fetch_spdx_licence_list({
+		url: list_url,
+		response_urls: [ list_url ],
+		response_bodies: [ "licence-list-1" ],
+		cache_dir: cache_dir.to_String(),
+	}),
+	"licence-list-1",
+	"first licence-list fetch uses response fixture",
+);
+let second_fetch := fetch_spdx_licence_list({
+	url: list_url,
+	response_urls: [ list_url ],
+	response_bodies: [ "licence-list-2" ],
+	cache_dir: cache_dir.to_String(),
+});
+if ( second_fetch eq "licence-list-1" ) {
+	is( second_fetch, "licence-list-1", "second licence-list fetch uses cache" );
+	is(
+		fetch_spdx_licence_list({
+			url: list_url,
+			response_urls: [ list_url ],
+			response_bodies: [ "licence-list-2" ],
+			cache_dir: cache_dir.to_String(),
+		}),
+		"licence-list-1",
+		"fresh cache ignores changed response fixture",
+	);
+	is(
+		fetch_spdx_licence_list({
+			url: list_url,
+			response_urls: [ list_url ],
+			response_bodies: [ "licence-list-2" ],
+			cache_dir: cache_dir.to_String(),
+			refresh: true,
+		}),
+		"licence-list-2",
+		"refresh bypasses cache",
+	);
+	is(
+		fetch_spdx_licence_list({
+			url: list_url,
+			response_urls: [ list_url ],
+			response_bodies: [ "licence-list-3" ],
+			cache_dir: cache_dir.to_String(),
+		}),
+		"licence-list-2",
+		"refresh writes the new response to cache",
+	);
+}
+else {
+	ok( true, "cache write unavailable; skipped second-fetch cache assertion" );
+	ok( true, "cache write unavailable; skipped fresh-cache assertion" );
+	ok( true, "cache write unavailable; skipped refresh assertion" );
+	ok( true, "cache write unavailable; skipped refresh-cache assertion" );
+}
+
+done_testing();

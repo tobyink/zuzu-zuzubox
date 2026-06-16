@@ -1,0 +1,191 @@
+from test/more import *;
+
+requires_capability( "fs" );
+requires_capability( "proc" );
+
+from std/archive import Archive;
+from std/data/json import JSON;
+from std/io import Path;
+from std/proc import Env;
+from std/string import contains, split;
+from zdf/zuzubox import Zuzubox;
+
+function ensure_dir ( path ) {
+	return true if path.is_dir();
+	let parent := path.parent();
+	ensure_dir(parent) if not parent.is_dir();
+	path.mkdir();
+	return true;
+}
+
+function write_file ( root, String relative, String contents ) {
+	let path := root;
+	for ( let part in split( relative, "/" ) ) {
+		path := path.child(part);
+	}
+	ensure_dir(path.parent());
+	path.spew_utf8(contents);
+	return path;
+}
+
+let root := Path.tempdir();
+write_file(
+	root,
+	"zuzu-distribution.json",
+	"{\"name\":\"sample-dist\",\"version\":\"0.0.1\",\"author\":\"Example\",\"license\":\"MIT\",\"status\":\"trial\",\"abstract\":\"Sample\"}\n",
+);
+write_file( root, "modules/sample/dist.zzm", "// module\n" );
+write_file(
+	root,
+	"tests/sample/dist.zzs",
+	"from test/more import *;\nok( true, \"sample\" );\ndone_testing();\n",
+);
+write_file( root, "README.md", "# sample-dist\n" );
+write_file( root, "CHANGELOG.md", "## 0.0.1\n" );
+write_file( root, "LICENCE", "MIT\n" );
+write_file( root, ".zuzuboxignore", "scratch/\n" );
+write_file( root, "scratch/notes.txt", "ignore me\n" );
+
+let box := new Zuzubox();
+let fallback_zuzu := ( new Path("../../zuzu-perl/bin/zuzu") ).absolute().to_String();
+box.set_zuzu_command(Env.get( "ZUZU", fallback_zuzu ));
+let json := new JSON();
+
+let verify := box.verify(root.to_String());
+ok( verify{ok}, "fixture verifies cleanly" );
+ok(
+	verify{files}.grep( fn f -> f eq "scratch/notes.txt" ).length() == 0,
+	"ignored files are not packaged",
+);
+
+let tests := box.test(root.to_String());
+ok( tests{ok}, "fixture tests pass" );
+is( tests{count}, 1, "one test discovered" );
+
+let archive := root.sibling("sample-dist-0.0.1.tar.gz");
+let build := box.build(
+	root.to_String(),
+	{ output: archive.to_String(), force: true },
+);
+ok( build{ok}, "fixture builds" );
+ok( archive.is_file(), "archive was written" );
+
+let loaded := Archive.load(archive, "tar.gz");
+ok(
+	loaded{entries}.grep(
+		fn e -> e{path} eq "sample-dist-0.0.1/modules/sample/dist.zzm",
+	).length() == 1,
+	"archive contains module under identity root",
+);
+
+let upload_dry := box.upload( archive.to_String(), { "dry-run": true } );
+ok( upload_dry{ok}, "upload dry-run does not require a token" );
+is(
+	upload_dry{identifier},
+	"sample-dist-0.0.1",
+	"upload dry-run reports archive identifier",
+);
+
+let token_file := root.child("token.txt");
+token_file.spew_utf8("zubox_test_token\n");
+let upload_json_confirm := box.upload(
+	archive.to_String(),
+	{ json: true, "token-file": token_file.to_String() },
+);
+ok(
+	not upload_json_confirm{ok},
+	"JSON upload requires explicit confirmation",
+);
+ok(
+	contains( upload_json_confirm{error}, "--yes" ),
+	"JSON upload confirmation error explains --yes",
+);
+
+let dry := box.build(
+	root.to_String(),
+	{ output: archive.to_String(), "dry-run": true, "no-test": true },
+);
+ok( dry{ok}, "dry-run build succeeds" );
+ok( dry{dry_run}, "dry-run flag is reported" );
+
+let minted_parent := Path.tempdir();
+let minted := minted_parent.child("minted");
+let mint := box.mint(
+	minted.to_String(),
+	{ module: "demo/tool", name: "demo-tool", "no-licence-text": true },
+);
+ok( mint{ok}, "mint succeeds with supplied names" );
+ok( minted.child("zuzu-distribution.json").is_file(), "mint writes metadata" );
+let minted_meta := json.decode(minted.child("zuzu-distribution.json").slurp_utf8());
+is(
+	minted_meta{license},
+	"Artistic-1.0 OR GPL-2.0-or-later",
+	"mint defaults to the dual Artistic/GPL SPDX expression",
+);
+ok(
+	minted.child("modules").child("demo").child("tool.zzm").is_file(),
+	"mint writes primary module",
+);
+ok( minted.child("LICENCE").is_file(), "mint writes LICENCE" );
+ok(
+	box.verify(minted.to_String()){ok},
+	"minted distribution verifies",
+);
+ok(
+	box.test(minted.to_String()){ok},
+	"minted distribution tests pass",
+);
+ok(
+	box.build(
+		minted.to_String(),
+		{
+			output: minted_parent.child("demo-tool-0.0.1.tar.gz").to_String(),
+			force: true,
+		},
+	){ok},
+	"minted distribution builds",
+);
+
+let gpl_parent := Path.tempdir();
+let gpl_minted := gpl_parent.child("minted");
+ok(
+	box.mint(
+		gpl_minted.to_String(),
+		{
+			module: "demo/gpl",
+			name: "demo-gpl",
+			licence: "GPL2+",
+			"no-licence-text": true,
+		},
+	){ok},
+	"mint accepts suggested licence aliases",
+);
+let gpl_meta := json.decode(gpl_minted.child("zuzu-distribution.json").slurp_utf8());
+is(
+	gpl_meta{license},
+	"GPL-2.0-or-later",
+	"mint writes alias choices as SPDX strings",
+);
+
+let bad_ignore := Path.tempdir();
+write_file(
+	bad_ignore,
+	"zuzu-distribution.json",
+	"{\"name\":\"bad-ignore\",\"version\":\"0.0.1\",\"author\":\"Example\",\"license\":\"MIT\",\"status\":\"trial\"}\n",
+);
+write_file( bad_ignore, "modules/bad/ignore.zzm", "// module\n" );
+write_file( bad_ignore, ".zuzuboxignore", "!\n..\\oops\n" );
+let bad_ignore_verify := box.verify(bad_ignore.to_String());
+ok( bad_ignore_verify{ok}, "malformed ignore rules warn without failing verify" );
+ok(
+	bad_ignore_verify{summary}{warnings} >= 1,
+	"malformed ignore rules increment warning count",
+);
+ok(
+	bad_ignore_verify{checks}.grep(
+		fn warning -> contains( warning{message}, ".zuzuboxignore" ),
+	).length() >= 1,
+	"malformed ignore rules are reported",
+);
+
+done_testing();

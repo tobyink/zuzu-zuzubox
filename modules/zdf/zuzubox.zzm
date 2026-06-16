@@ -1,0 +1,1863 @@
+=encoding utf8
+
+=head1 NAME
+
+zdf/zuzubox - Author, verify, build, and upload ZDF-1 distributions.
+
+=head1 SYNOPSIS
+
+  from zdf/zuzubox import Zuzubox;
+
+  let box := new Zuzubox();
+  let result := box.verify( "." );
+
+=head1 DESCRIPTION
+
+C<zdf/zuzubox> implements the reusable engine behind the C<zuzubox>
+command-line tool. It mirrors the ZDF-1 rules enforced by the Zuzulang.org
+upload validator, runs package tests in place, builds C<tar.gz> archives,
+and uploads archives through the token-authenticated distribution API.
+
+=head1 EXPORTS
+
+=head2 C<Zuzubox>
+
+Stateful helper class. Public methods are C<mint>, C<verify>, C<test>,
+C<build>, and C<upload>.
+
+=head2 C<run_cli(argv)>
+
+Runs the command-line interface and returns a process exit code.
+
+=head1 COPYRIGHT AND LICENCE
+
+B<< zdf/zuzubox >> is copyright Toby Inkster.
+
+It is free software; you may redistribute it and/or modify it under
+the terms of either the Artistic License 1.0 or the GNU General Public
+License version 2.
+
+=cut
+
+from std/archive import Archive;
+from std/data/json import JSON;
+from std/getopt import Getopt;
+from std/io import Path, STDERR, STDOUT;
+from std/net/http import UserAgent;
+from std/proc import Env, Proc;
+from std/string import chomp, chr, contains, ends_with, join, split, starts_with, substr, trim;
+from std/time import Time;
+from std/tui import colour_text, readline, supports_ansi;
+from licence/spdx import is_spdx_expression, licence_expression_text, normalize_spdx_expression;
+from test/parser import parse as parse_tap;
+
+const ZUZUBOX_VERSION := "0.0.1";
+const DEFAULT_MAX_BYTES := 20 * 1024 * 1024;
+const DEFAULT_LICENCE := "Artistic-1.0 OR GPL-2.0-or-later";
+
+function _has_zuzu_shebang;
+function _archive_identity;
+
+function _opt ( options, key, fallback := null ) {
+	if ( options instanceof Dict and options.exists(key) ) {
+		return options.get(key);
+	}
+	return fallback;
+}
+
+function _truthy ( value ) {
+	return value ? true : false;
+}
+
+function _has ( options, key ) {
+	return _truthy(_opt( options, key, false ));
+}
+
+function _copy_options ( options ) {
+	let out := {};
+	if ( options instanceof Dict ) {
+		for ( let key in options.keys() ) {
+			out.set( key, options.get(key) );
+		}
+	}
+	return out;
+}
+
+function _json_codec () {
+	return new JSON( pretty: true, canonical: true );
+}
+
+function _plain_json ( value ) {
+	return _json_codec().encode(value) _ "\n";
+}
+
+function _today () {
+	return ( new Time() ).strftime("%Y-%m-%d");
+}
+
+function _ensure_dir ( path ) {
+	return true if path.is_dir();
+	die path.to_String() _ " exists and is not a directory" if path.is_file();
+	let parent := path.parent();
+	_ensure_dir(parent) if not parent.is_dir();
+	path.mkdir();
+	return true;
+}
+
+function _ensure_parent ( path ) {
+	_ensure_dir(path.parent());
+	return true;
+}
+
+function _path_child ( root, String relative ) {
+	let out := root;
+	for ( let part in split( relative, "/" ) ) {
+		next if part eq "";
+		out := out.child(part);
+	}
+	return out;
+}
+
+function _relative_path ( root, path ) {
+	let prefix := root.to_String() _ "/";
+	let text := path.to_String();
+	if ( starts_with( text, prefix ) ) {
+		return substr( text, length prefix );
+	}
+	return path.basename();
+}
+
+function _sorted_strings ( values ) {
+	return values.sort( fn ( a, b ) -> ( "" _ a ) cmp ( "" _ b ) );
+}
+
+function _walk_files ( root ) {
+	let found := [];
+	function walk ( path ) {
+		return if not path.is_dir();
+		for ( let child in path.children() ) {
+			if ( child.is_dir() ) {
+				walk(child);
+			}
+			else if ( child.is_file() ) {
+				found.push(_relative_path( root, child ));
+			}
+		}
+	}
+	walk(root);
+	return _sorted_strings(found);
+}
+
+function _walk_tests ( root ) {
+	let test_root := root.child("tests");
+	return [] if not test_root.is_dir();
+	let found := [];
+	function walk ( path ) {
+		for ( let child in path.children() ) {
+			if ( child.is_dir() ) {
+				walk(child);
+			}
+			else if ( child.is_file() ) {
+				let rel := _relative_path( root, child );
+				if ( ends_with( rel, ".zzs" ) or _has_zuzu_shebang(child) ) {
+					found.push(rel);
+				}
+			}
+		}
+	}
+	walk(test_root);
+	return _sorted_strings(found);
+}
+
+function _safe_path ( String relative ) {
+	return false if relative eq "";
+	return false if starts_with( relative, "/" );
+	return false if contains( relative, "\\" );
+	return false if contains( relative, chr(0) );
+	for ( let part in split( relative, "/" ) ) {
+		return false if part eq "" or part eq "." or part eq "..";
+	}
+	return true;
+}
+
+function _module_name_ok ( String name ) {
+	return name ~ /^[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*$/;
+}
+
+function _dist_name_ok ( String name ) {
+	return name ~ /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+}
+
+function _version_ok ( String version ) {
+	return version ~ /^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$/;
+}
+
+function _url_ok ( String url ) {
+	return url ~ /^https?:\/\/[^\s]+$/ and length url <= 1024;
+}
+
+function _has_extension ( String basename ) {
+	return contains( basename, "." );
+}
+
+function _has_zuzu_shebang ( path ) {
+	let text := "";
+	try {
+		text := path.slurp_utf8();
+	}
+	catch {
+		return false;
+	}
+	let lines := split( text, "\n" );
+	let first := lines.length() == 0 ? "" : lines[0];
+	return starts_with( first, "#!" ) and contains( first, "zuzu" );
+}
+
+function _top_level_doc ( String relative ) {
+	return false if contains( relative, "/" );
+	return true if relative ~ /^[^\/]+\.(?:md|pod|txt)$/i;
+	return true if relative ~ /^[A-Z0-9_-]+$/;
+	return false;
+}
+
+function _zdf_allowed ( root, String relative ) {
+	return false if not _safe_path(relative);
+	return true if relative eq "zuzu-distribution.json";
+	return true if relative eq "Build.zzs";
+	return true if relative eq "LICENCE" or relative eq "LICENCE.txt";
+	return true if relative eq "LICENSE" or relative eq "LICENSE.txt";
+	return true if _top_level_doc(relative);
+	return true if relative ~ /^modules\/[A-Za-z0-9._\/-]+\.zzm$/;
+	return true if relative ~ /^scripts\/[A-Za-z0-9._\/-]+\.zzs$/;
+	if ( relative ~ /^scripts\/[A-Za-z0-9._\/-]+$/ ) {
+		let base := _path_child( root, relative ).basename();
+		return true if not _has_extension(base)
+			and _has_zuzu_shebang(_path_child( root, relative ));
+	}
+	return true if relative ~ /^tests\/[A-Za-z0-9._\/-]+$/;
+	return true if relative ~ /^inc\/[A-Za-z0-9._\/-]+\.zzm$/;
+	return false;
+}
+
+function _zdf_allowed_archive_entry ( String relative, data ) {
+	return false if not _safe_path(relative);
+	return true if relative eq "zuzu-distribution.json";
+	return true if relative eq "Build.zzs";
+	return true if relative eq "LICENCE" or relative eq "LICENCE.txt";
+	return true if relative eq "LICENSE" or relative eq "LICENSE.txt";
+	return true if _top_level_doc(relative);
+	return true if relative ~ /^modules\/[A-Za-z0-9._\/-]+\.zzm$/;
+	return true if relative ~ /^scripts\/[A-Za-z0-9._\/-]+\.zzs$/;
+	if ( relative ~ /^scripts\/[A-Za-z0-9._\/-]+$/ ) {
+		let base_parts := split( relative, "/" );
+		let base := base_parts[base_parts.length() - 1];
+		if ( not _has_extension(base) ) {
+			let text := to_string(data);
+			let lines := split( text, "\n" );
+			let first := lines.length() == 0 ? "" : lines[0];
+			return true if starts_with( first, "#!" ) and contains( first, "zuzu" );
+		}
+	}
+	return true if relative ~ /^tests\/[A-Za-z0-9._\/-]+$/;
+	return true if relative ~ /^inc\/[A-Za-z0-9._\/-]+\.zzm$/;
+	return false;
+}
+
+function _is_always_excluded ( String relative ) {
+	return true if relative eq ".zuzuboxignore";
+	return true if relative eq ".gitignore" or relative eq ".gitmodules";
+	return true if relative eq ".DS_Store";
+	return true if starts_with( relative, ".git/" );
+	return true if starts_with( relative, ".svn/" );
+	return true if starts_with( relative, ".hg/" );
+	return true if ends_with( relative, ".tar.gz" );
+	return true if ends_with( relative, ".swp" );
+	return true if ends_with( relative, "~" );
+	return false;
+}
+
+function _ignore_lines ( root ) {
+	let file := root.child(".zuzuboxignore");
+	return [] if not file.is_file();
+	let out := [];
+	for ( let line in split( file.slurp_utf8(), "\n" ) ) {
+		out.push(chomp(line));
+	}
+	return out;
+}
+
+function _ignore_rule_warnings ( root ) {
+	let warnings := [];
+	let number := 0;
+	for ( let raw in _ignore_lines(root) ) {
+		number++;
+		let line := trim(raw);
+		next if line eq "" or starts_with( line, "#" );
+		let negated := starts_with( line, "!" );
+		let rule := negated ? substr( line, 1 ) : line;
+		if ( trim(rule) eq "" ) {
+			warnings.push("line " _ number _ ": empty ignore rule");
+			next;
+		}
+		if ( contains( rule, "\\" ) ) {
+			warnings.push("line " _ number _ ": use / in ignore rules");
+		}
+		if (
+			rule eq ".."
+			or starts_with( rule, "../" )
+			or contains( rule, "/../" )
+			or ends_with( rule, "/.." )
+		) {
+			warnings.push("line " _ number _ ": ignore rule must stay inside the distribution");
+		}
+	}
+	return warnings;
+}
+
+function _rule_to_regexp_text ( String rule ) {
+	let out := "^";
+	let i := 0;
+	while ( i < length rule ) {
+		let ch := substr( rule, i, 1 );
+		if ( ch eq "*" ) {
+			if ( i + 1 < length rule and substr( rule, i + 1, 1 ) eq "*" ) {
+				out := out _ ".*";
+				i += 2;
+				next;
+			}
+			out := out _ "[^/]*";
+		}
+		else if ( ch eq "?" ) {
+			out := out _ "[^/]";
+		}
+		else if ( ch ~ /[A-Za-z0-9_\/-]/ ) {
+			out := out _ ch;
+		}
+		else if ( ch eq "." ) {
+			out := out _ "\\.";
+		}
+		else {
+			out := out _ "\\" _ ch;
+		}
+		i++;
+	}
+	return out _ "$";
+}
+
+function _join_array_from ( String separator, parts, start ) {
+	let out := [];
+	let i := start;
+	while ( i < parts.length() ) {
+		out.push(parts[i]);
+		i++;
+	}
+	return join( separator, out );
+}
+
+function _rule_matches ( String rule, String relative ) {
+	let anchored := starts_with( rule, "/" );
+	let dir_rule := ends_with( rule, "/" );
+	let pattern := rule;
+	pattern := substr( pattern, 1 ) if anchored;
+	pattern := substr( pattern, 0, length pattern - 1 ) if dir_rule;
+	return false if pattern eq "";
+
+	let candidates := [ relative ];
+	if ( not anchored ) {
+			let parts := split( relative, "/" );
+			let i := 1;
+			while ( i < parts.length() ) {
+				candidates.push(_join_array_from( "/", parts, i ));
+				i++;
+			}
+		}
+
+	let rx := _rule_to_regexp_text(pattern);
+	for ( let candidate in candidates ) {
+		return true if candidate ~ rx;
+		if ( dir_rule and starts_with( candidate, pattern _ "/" ) ) {
+			return true;
+		}
+	}
+	return false;
+}
+
+function _ignore_decision ( rules, String relative ) {
+	return {
+		excluded: true,
+		reason: "built-in exclusion",
+	} if _is_always_excluded(relative);
+
+	let excluded := false;
+	let reason := null;
+	for ( let raw in rules ) {
+		let line := trim(raw);
+		next if line eq "" or starts_with( line, "#" );
+		let negated := starts_with( line, "!" );
+		let rule := negated ? substr( line, 1 ) : line;
+		next if rule eq "";
+		if ( _rule_matches( rule, relative ) ) {
+			excluded := not negated;
+			reason := line;
+		}
+	}
+	return {
+		excluded: excluded,
+		reason: reason,
+	};
+}
+
+function _package_plan ( root ) {
+	let rules := _ignore_lines(root);
+	let included := [];
+	let excluded := [];
+	let disallowed := [];
+
+	for ( let relative in _walk_files(root) ) {
+		let decision := _ignore_decision( rules, relative );
+		if ( decision{excluded} ) {
+			excluded.push({
+				path: relative,
+				reason: decision.get( "reason", "ignored" ),
+			});
+			next;
+		}
+		if ( _zdf_allowed( root, relative ) ) {
+			included.push(relative);
+		}
+		else {
+			disallowed.push(relative);
+		}
+	}
+
+	return {
+		files: _sorted_strings(included),
+		excluded: excluded,
+		disallowed: _sorted_strings(disallowed),
+	};
+}
+
+function _module_from_source ( String relative ) {
+	let name := substr( relative, length "modules/" );
+	return substr( name, 0, length name - 4 );
+}
+
+function _script_from_source ( String relative ) {
+	let name := substr( relative, length "scripts/" );
+	if ( ends_with( lc(name), ".zzs" ) ) {
+		return substr( name, 0, length name - 4 );
+	}
+	return name;
+}
+
+function _trim_slashes ( String text ) {
+	let out := text;
+	while ( starts_with( out, "/" ) ) {
+		out := substr( out, 1 );
+	}
+	while ( ends_with( out, "/" ) ) {
+		out := substr( out, 0, length out - 1 );
+	}
+	return out;
+}
+
+function _reserved_name ( String name ) {
+	let lowered := lc(_trim_slashes(name));
+	for ( let reserved in [
+		"javascript",
+		"local",
+		"perl",
+		"std",
+		"test/more",
+		"test/parser",
+		"zuzu",
+	] ) {
+		return true if lowered eq reserved;
+		return true if starts_with( lowered, reserved _ "/" );
+	}
+	return false;
+}
+
+function _marker ( String status, options ) {
+	let unicode := not _has( options, "ascii" );
+	if ( unicode ) {
+		return "✅" if status eq "pass";
+		return "🟡" if status eq "warn";
+		return "❌" if status eq "fail";
+	}
+	return "[okay]" if status eq "pass";
+	return "[warn]" if status eq "warn";
+	return "[FAIL]";
+}
+
+function _colour_for ( String status ) {
+	return "green" if status eq "pass";
+	return "yellow" if status eq "warn";
+	return "red" if status eq "fail";
+	return null;
+}
+
+function _colour_enabled ( options ) {
+	return false if _has( options, "json" );
+	return false if _has( options, "no-colour" ) or _has( options, "no-color" );
+	let when := "" _ _opt( options, "colour", _opt( options, "color", "auto" ) );
+	return false if when eq "never";
+	return true if when eq "always";
+	return false if Env.get("NO_COLOR", "") ne "";
+	return supports_ansi();
+}
+
+function _paint ( text, colour, options ) {
+	return "" _ text if not _colour_enabled(options);
+	return colour_text( text, colour );
+}
+
+function _status_line ( check, options ) {
+	return if _has( options, "quiet" );
+	let status := check{status};
+	STDOUT.say(
+		_paint( _marker( status, options ), _colour_for(status), options ) _
+		" " _
+		check{message}
+	);
+}
+
+function _summary_text ( String command, summary, extra? ) {
+	let text := command _ ": " _
+		summary{passed} _ " passed, " _
+		summary{warnings} _ " warnings, " _
+		summary{failures} _ " failures";
+	if ( extra != null and extra ne "" ) {
+		text := text _ " (" _ extra _ ")";
+	}
+	return text;
+}
+
+function _summarize_checks ( checks ) {
+	let summary := {
+		passed: 0,
+		warnings: 0,
+		failures: 0,
+	};
+	for ( let check in checks ) {
+		if ( check{status} eq "pass" ) {
+			summary{passed}++;
+		}
+		else if ( check{status} eq "warn" ) {
+			summary{warnings}++;
+		}
+		else {
+			summary{failures}++;
+		}
+	}
+	return summary;
+}
+
+function _check ( checks, String id, String status, String message ) {
+	checks.push({
+		id: id,
+		status: status,
+		message: message,
+	});
+	return checks;
+}
+
+function _read_metadata ( root ) {
+	return ( new JSON( pairlists: true ) ).load(root.child("zuzu-distribution.json"));
+}
+
+function _metadata_identifier ( metadata ) {
+	return "" _ metadata{name} _ "-" _ metadata{version};
+}
+
+function _zuzu_command () {
+	let configured := Env.get("ZUZU_COMMAND", "");
+	return configured if configured ne "";
+
+	for ( let candidate in [
+		"../../zuzu-perl/bin/zuzu",
+		"../zuzu-perl/bin/zuzu",
+		"zuzu-perl/bin/zuzu",
+		"bin/zuzu",
+	] ) {
+		let path := new Path(candidate);
+		return path.absolute().to_String()
+			if path.is_file();
+	}
+	return "zuzu";
+}
+
+function _find_working_copy_for_archive ( archive ) {
+	let basename := archive.basename();
+	return null if not ends_with( basename, ".tar.gz" );
+	let identifier := substr( basename, 0, length basename - 7 );
+	let parent := archive.parent();
+	for ( let child in parent.children() ) {
+		next if not child.is_dir();
+		let meta_file := child.child("zuzu-distribution.json");
+		next if not meta_file.is_file();
+		try {
+			let meta := ( new JSON( pairlists: true ) ).load(meta_file);
+			if ( _metadata_identifier(meta) eq identifier ) {
+				return child;
+			}
+		}
+		catch {
+			next;
+		}
+	}
+	return null;
+}
+
+function _include_args ( root ) {
+	let args := [];
+	let modules := root.child("modules");
+	let inc := root.child("inc");
+	args.push("-I" _ modules.to_String()) if modules.is_dir();
+	args.push("-I" _ inc.to_String()) if inc.is_dir();
+	return args;
+}
+
+function _test_ok ( parsed, run_result ) {
+	return false if not Proc.is_success(run_result);
+	return false if parsed{assertions}{failed} > 0;
+	return false if parsed{planned} != null
+		and parsed{assertions}{total} != parsed{planned};
+	return true;
+}
+
+function _root_for ( dir ) {
+	let path := new Path("" _ dir);
+	return path.absolute();
+}
+
+function _size_human ( Number bytes ) {
+	return "" _ bytes _ " B" if bytes < 1024;
+	let kib := bytes / 1024;
+	return "" _ int(kib * 10) / 10 _ " KiB" if bytes < 1024 * 1024;
+	let mib := bytes / ( 1024 * 1024 );
+	return "" _ int(mib * 10) / 10 _ " MiB";
+}
+
+function _archive_identity ( archive ) {
+	let loaded := Archive.load(archive, "tar.gz");
+	let root := null;
+	let metadata := null;
+	let shippable := false;
+	for ( let entry in loaded{entries} ) {
+		die "archive contains an unsafe path" if not _safe_path(entry{path});
+		let parts := split( entry{path}, "/" );
+		die "archive contains an unsafe path" if parts.length() < 2;
+		if ( root == null ) {
+			root := parts[0];
+		}
+		else if ( root ne parts[0] ) {
+			die "archive contains multiple top-level directories";
+		}
+			let relative := _join_array_from( "/", parts, 1 );
+		if ( relative eq "zuzu-distribution.json" ) {
+			metadata := ( new JSON( pairlists: true ) ).decode_binarystring(
+				entry{data},
+			);
+		}
+		if ( starts_with( relative, "modules/" ) ) {
+			let module_name := _module_from_source(relative);
+			die "archive contains a reserved module name"
+				if _reserved_name(module_name);
+			shippable := true;
+		}
+		else if ( starts_with( relative, "scripts/" ) ) {
+			let script_name := _script_from_source(relative);
+			die "archive contains a reserved script name"
+				if _reserved_name(script_name);
+			shippable := true;
+		}
+		die "archive contains an unexpected file"
+			if not _zdf_allowed_archive_entry(
+				relative,
+				entry{data},
+			);
+	}
+	die "archive is missing zuzu-distribution.json" if metadata == null;
+	for ( let field in [ "name", "version", "author", "license" ] ) {
+		die "archive metadata is missing " _ field
+			if not metadata.exists(field)
+				or not( metadata.get(field) instanceof String )
+				or trim(metadata.get(field)) eq "";
+	}
+	die "archive metadata name is not valid"
+		if not _dist_name_ok("" _ metadata{name});
+	die "archive metadata version is not valid"
+		if not _version_ok("" _ metadata{version});
+	if ( metadata.exists("status") ) {
+		let status := "" _ metadata{status};
+		die "archive metadata status is not valid"
+			if status ne "stable" and status ne "trial";
+	}
+	die "archive metadata repo is not valid"
+		if metadata.exists("repo") and not _url_ok("" _ metadata{repo});
+	if ( metadata.exists("dependencies") ) {
+		die "archive metadata dependencies must be an object"
+			if not( metadata{dependencies} instanceof Dict )
+				and not( metadata{dependencies} instanceof PairList );
+		for ( let dep in metadata{dependencies}.keys() ) {
+			let value := metadata{dependencies}.get(dep);
+			die "archive metadata dependencies are not valid"
+				if not _module_name_ok("" _ dep)
+					or not( value instanceof String )
+					or trim(value) eq "";
+		}
+	}
+	die "archive contains no shippable module or script" if not shippable;
+	let identifier := _metadata_identifier(metadata);
+	die "archive identity does not match metadata" if identifier ne root;
+	return {
+		identifier: identifier,
+		metadata: metadata,
+		root: root,
+	};
+}
+
+function _confirmed_upload ( archive, String target, identity, options ) {
+	return true if _has( options, "yes" );
+	if ( _has( options, "json" ) ) {
+		return false;
+	}
+	STDERR.say("Upload " _ identity{identifier} _ " to " _ target _ "?");
+	let answer := readline( "Proceed? [y/N] ", "n", null );
+	return false if answer == null;
+	return ( "" _ answer ) ~ /^(?:y|yes)$/i;
+}
+
+function _upload_progress ( String message, options ) {
+	return true if _has( options, "quiet" ) or _has( options, "json" );
+	STDERR.say(message);
+	return true;
+}
+
+function _multipart_archive_body ( archive, String boundary ) {
+	let head := "--" _ boundary _ "\r\n"
+		_ "Content-Disposition: form-data; name=\"archive\"; filename=\""
+		_ archive.basename() _ "\"\r\n"
+		_ "Content-Type: application/gzip\r\n\r\n";
+	let tail := "\r\n--" _ boundary _ "--\r\n";
+	return to_binary(head) _ archive.slurp() _ to_binary(tail);
+}
+
+function _multipart_archive_file ( archive ) {
+	let boundary := "zuzubox-" _ ( new Time() ).epoch() _ "-" _ archive.size();
+	let body := Path.tempfile();
+	body.spew(_multipart_archive_body( archive, boundary ));
+	return {
+		path: body,
+		boundary: boundary,
+	};
+}
+
+function _licence_suggestions () {
+	return join( ", ", [
+		DEFAULT_LICENCE,
+		"GPL2+",
+		"GPL3+",
+		"LGPL2.1+",
+		"MIT",
+		"Apache",
+		"CC0",
+		"BSD-3-clause",
+	] );
+}
+
+function _licence_alias ( String raw ) {
+	let trimmed := trim(raw);
+	return DEFAULT_LICENCE if trimmed eq "";
+	if ( trimmed eq "GPL2+" ) { return "GPL-2.0-or-later"; }
+	if ( trimmed eq "GPL3+" ) { return "GPL-3.0-or-later"; }
+	if ( trimmed eq "LGPL2.1+" ) { return "LGPL-2.1-or-later"; }
+	if ( trimmed eq "Apache" ) { return "Apache-2.0"; }
+	if ( trimmed eq "CC0" ) { return "CC0-1.0"; }
+	if ( trimmed eq "BSD-3-clause" ) { return "BSD-3-Clause"; }
+	return trimmed;
+}
+
+function _normalize_licence_choice ( value ) {
+	return normalize_spdx_expression(_licence_alias("" _ value));
+}
+
+function _mint_licence ( options, Boolean prompted ) {
+	let raw := _opt( options, "licence", _opt( options, "license", null ) );
+	if ( raw != null ) {
+		let spdx := _normalize_licence_choice(raw);
+		die "licence must be an SPDX expression; suggestions: "
+			_ _licence_suggestions()
+			if spdx == null;
+		return spdx;
+	}
+
+	return DEFAULT_LICENCE if not prompted;
+
+	STDERR.say("Suggested licence choices: " _ _licence_suggestions());
+	STDERR.say("You can also enter any valid SPDX licence expression.");
+	STDERR.say("Press Enter for " _ DEFAULT_LICENCE _ ".");
+	while ( true ) {
+		raw := readline( "Licence: ", DEFAULT_LICENCE, null );
+		die "mint requires a licence" if raw == null;
+
+		let spdx := _normalize_licence_choice(raw);
+		return spdx if spdx != null;
+
+		STDERR.say(
+			"Enter a valid SPDX expression. Suggestions: "
+			_ _licence_suggestions()
+		);
+	}
+}
+
+function _licence_file_text ( String licence, options? ) {
+	return "Add the full licence text for: " _ licence _ "\n"
+		if _has( options, "no-licence-text" )
+			or _has( options, "no-license-text" );
+	try {
+		let text := licence_expression_text(licence, options);
+		return text if text != null and trim(text) ne "";
+	}
+	catch {
+	}
+	return "Add the full licence text for: " _ licence _ "\n";
+}
+
+class Zuzubox {
+	let zuzu_command with get, set := null;
+
+	method _zuzu_command () {
+		return self{zuzu_command} if self{zuzu_command} != null;
+		self{zuzu_command} := _zuzu_command();
+		return self{zuzu_command};
+	}
+
+	method mint ( dir, options? ) {
+		let root_name := "" _ ( dir == null ? "" : dir );
+		let module_name := _opt( options, "module", null );
+		let prompted := false;
+		while ( module_name == null or module_name eq "" ) {
+			prompted := true;
+			module_name := readline( "Primary module name: ", "", null );
+			die "mint requires a primary module name" if module_name == null;
+			module_name := trim(module_name);
+		}
+		die "primary module name is not valid" if not _module_name_ok(module_name);
+
+		let default_name := module_name;
+		default_name := join( "-", split( default_name, "/" ) );
+		let dist_name := _opt( options, "name", null );
+		if ( dist_name == null or dist_name eq "" ) {
+			prompted := true;
+			dist_name := readline(
+				"Distribution name [" _ default_name _ "]: ",
+				default_name,
+				null,
+			);
+			dist_name := default_name if dist_name == null or dist_name eq "";
+		}
+		dist_name := trim(dist_name);
+		die "distribution name is not valid" if not _dist_name_ok(dist_name);
+
+		let licence := _mint_licence( options, prompted );
+		let root := new Path( root_name eq "" ? dist_name : root_name );
+		if ( root.is_file() ) {
+			die "mint target is not a directory";
+		}
+		if ( root.is_dir() ) {
+			die "mint target is not empty"
+				if root.children().length() > 0;
+		}
+		else {
+			_ensure_dir(root);
+		}
+
+		let author := Env.get("ZUZU_AUTHOR", Env.get("USER", "Your Name"));
+		let codec := _json_codec();
+		let created := [];
+
+		function write_file ( String relative, String text ) {
+			let file := _path_child( root, relative );
+			die `refusing to overwrite ${relative}`
+				if file.is_file() or file.is_dir();
+			_ensure_parent(file);
+			file.spew_utf8(text);
+			created.push(relative);
+		}
+
+		write_file(
+			"zuzu-distribution.json",
+			codec.encode({
+				name: dist_name,
+				version: "0.0.1",
+				author: author,
+				license: licence,
+				status: "trial",
+				abstract: "",
+				dependencies: {},
+			}) _ "\n",
+		);
+		write_file(
+			"modules/" _ module_name _ ".zzm",
+			"=encoding utf8\n\n" _
+			"=head1 NAME\n\n" _
+			module_name _ " - Newly minted ZuzuScript module.\n\n" _
+			"=head1 DESCRIPTION\n\n" _
+			"Replace this stub with useful documentation and code.\n\n" _
+			"=cut\n",
+		);
+		write_file(
+			"tests/" _ module_name _ ".zzs",
+			"from " _ module_name _ " import *;\n\n" _
+			"from test/more import *;\n\n" _
+			"pass( \"" _ module_name _ " loads\" );\n\n" _
+			"done_testing();\n",
+		);
+		write_file(
+			"CHANGELOG.md",
+			"# Changelog\n\n" _
+			"## 0.0.1 - " _ _today() _ "\n\n" _
+			"*First release.*\n",
+		);
+		write_file(
+			"README.md",
+			"# " _ dist_name _ "\n\n" _
+			"`" _ module_name _ "` is a ZuzuScript module.\n\n" _
+			"## Synopsis\n\n```zzs\n" _
+			"from " _ module_name _ " import *;\n" _
+			"```\n\n## Description\n\nDescribe the distribution here.\n",
+		);
+		write_file(
+			"LICENCE",
+			_licence_file_text( licence, options ),
+		);
+		write_file(
+			".zuzuboxignore",
+			"# Files excluded from ZDF-1 archives.\n" _
+			"# scratch/\n# *.bak\n",
+		);
+
+		return {
+			ok: true,
+			dir: root.to_String(),
+			files: _sorted_strings(created),
+			name: dist_name,
+			module: module_name,
+		};
+	}
+
+	method verify ( dir, options? ) {
+		let root := _root_for(dir);
+		let checks := [];
+		let meta := null;
+		let metadata_file := root.child("zuzu-distribution.json");
+
+		if ( metadata_file.is_file() ) {
+			try {
+				meta := _read_metadata(root);
+				if ( meta instanceof Dict or meta instanceof PairList ) {
+					_check( checks, "metadata-json", "pass", "zuzu-distribution.json is valid JSON" );
+				}
+				else {
+					_check( checks, "metadata-json", "fail", "zuzu-distribution.json must contain an object" );
+				}
+			}
+			catch ( Exception e ) {
+				_check( checks, "metadata-json", "fail", "zuzu-distribution.json does not parse: " _ e{message} );
+			}
+		}
+		else {
+			_check( checks, "metadata-exists", "fail", "zuzu-distribution.json is missing" );
+		}
+
+		if ( meta instanceof Dict or meta instanceof PairList ) {
+			for ( let field in [ "name", "version", "author", "license" ] ) {
+				let ok := meta.exists(field)
+					and meta.get(field) instanceof String
+					and trim(meta.get(field)) ne "";
+				_check(
+					checks,
+					"metadata-" _ field,
+					ok ? "pass" : "fail",
+					ok ? field _ " is present" : field _ " is missing or empty",
+				);
+			}
+			if ( meta.exists("license") ) {
+				_check(
+					checks,
+					"metadata-licence-spdx",
+					is_spdx_expression(meta.get("license")) ? "pass" : "fail",
+					is_spdx_expression(meta.get("license"))
+						? "licence is a valid SPDX expression"
+						: "licence is not a valid SPDX expression",
+				);
+			}
+			for ( let warning in _ignore_rule_warnings(root) ) {
+				_check( checks, "ignore-rule", "warn", ".zuzuboxignore " _ warning );
+			}
+			if ( meta.exists("name") ) {
+				_check(
+					checks,
+					"metadata-name-pattern",
+					_dist_name_ok("" _ meta{name}) ? "pass" : "fail",
+					"name matches ZDF-1 pattern",
+				);
+			}
+			if ( meta.exists("version") ) {
+				_check(
+					checks,
+					"metadata-version-pattern",
+					_version_ok("" _ meta{version}) ? "pass" : "fail",
+					"version matches ZDF-1 pattern",
+				);
+			}
+			if ( meta.exists("status") ) {
+				let status := "" _ meta{status};
+				_check(
+					checks,
+					"metadata-status",
+					( status eq "stable" or status eq "trial" ) ? "pass" : "fail",
+					"status is " _ status,
+				);
+			}
+			if ( meta.exists("repo") ) {
+				_check(
+					checks,
+					"metadata-repo",
+					_url_ok("" _ meta{repo}) ? "pass" : "fail",
+					"repo is a valid http/https URL",
+				);
+			}
+			if ( meta.exists("dependencies") ) {
+				let deps_ok := meta{dependencies} instanceof Dict
+					or meta{dependencies} instanceof PairList;
+				if ( deps_ok ) {
+					for ( let dep in meta{dependencies}.keys() ) {
+						let value := meta{dependencies}.get(dep);
+						deps_ok := false if not _module_name_ok("" _ dep);
+						deps_ok := false if not( value instanceof String ) or trim(value) eq "";
+					}
+				}
+				_check(
+					checks,
+					"metadata-dependencies",
+					deps_ok ? "pass" : "fail",
+					"dependencies are valid",
+				);
+			}
+			if ( meta.exists("abstract") ) {
+				let abstract_ok := meta{abstract} instanceof String
+					and length meta{abstract} <= 140;
+				_check(
+					checks,
+					"metadata-abstract",
+					abstract_ok ? "pass" : "warn",
+					abstract_ok ? "abstract is upload friendly" : "abstract should be a string of 140 characters or fewer",
+				);
+			}
+			else {
+				_check( checks, "metadata-abstract", "warn", "abstract is missing" );
+			}
+		}
+
+		let plan := _package_plan(root);
+		if ( plan{disallowed}.length() == 0 ) {
+			_check( checks, "package-membership", "pass", "all unignored files are ZDF-1 allowed" );
+		}
+		else {
+			for ( let bad in plan{disallowed} ) {
+				_check( checks, "package-membership", "fail", bad _ " is not a ZDF-1 allowed path" );
+			}
+		}
+
+		let shippable := false;
+		for ( let file in plan{files} ) {
+			shippable := true if starts_with( file, "modules/" )
+				or starts_with( file, "scripts/" );
+		}
+		_check(
+			checks,
+			"shippable-artifact",
+			shippable ? "pass" : "fail",
+			shippable ? "at least one module or script will ship" : "no modules or scripts will ship",
+		);
+
+		for ( let file in plan{files} ) {
+			if ( starts_with( file, "modules/" ) ) {
+				let module_name := _module_from_source(file);
+				_check(
+					checks,
+					"reserved-" _ file,
+					_reserved_name(module_name) ? "fail" : "pass",
+					_reserved_name(module_name) ? file _ " uses a reserved module name" : file _ " uses an uploadable module name",
+				);
+			}
+			else if ( starts_with( file, "scripts/" ) ) {
+				let script_name := _script_from_source(file);
+				_check(
+					checks,
+					"reserved-" _ file,
+					_reserved_name(script_name) ? "fail" : "pass",
+					_reserved_name(script_name) ? file _ " uses a reserved script name" : file _ " uses an uploadable script name",
+				);
+			}
+		}
+
+		for ( let file in plan{files} ) {
+			next if not starts_with( file, "modules/" )
+				and not starts_with( file, "scripts/" );
+			let argv := _include_args(root);
+			argv.push("--lint");
+			argv.push(file);
+			let lint := Proc.run(
+				self._zuzu_command(),
+				argv,
+				{
+					cwd: root.to_String(),
+					capture_stdout: true,
+					capture_stderr: true,
+				},
+			);
+			if ( not Proc.is_success(lint) and starts_with( file, "modules/" ) ) {
+				let module_name := _module_from_source(file);
+				let fallback_argv := _include_args(root);
+				fallback_argv.push("-e");
+				fallback_argv.push("from " _ module_name _ " import *;");
+				lint := Proc.run(
+					self._zuzu_command(),
+					fallback_argv,
+					{
+						cwd: root.to_String(),
+						capture_stdout: true,
+						capture_stderr: true,
+					},
+				);
+			}
+			_check(
+				checks,
+				"parse-" _ file,
+				Proc.is_success(lint) ? "pass" : "fail",
+				Proc.is_success(lint)
+					? file _ " parses"
+					: file _ " does not parse: " _ Proc.status_text(lint),
+			);
+		}
+
+		let docs := false;
+		let changelog := false;
+		let licence := false;
+		for ( let file in plan{files} ) {
+			docs := true if file eq "README.md" or file eq "README.txt" or file eq "README.pod";
+			changelog := true if file ~ /^CHANGELOG(?:\.(?:md|txt|pod))?$/i;
+			licence := true if file eq "LICENCE" or file eq "LICENCE.txt" or file eq "LICENSE" or file eq "LICENSE.txt";
+		}
+		_check( checks, "readme", docs ? "pass" : "warn", docs ? "README exists" : "README is missing" );
+		_check(
+			checks,
+			"changelog",
+			changelog ? "pass" : "warn",
+			changelog ? "CHANGELOG exists" : "CHANGELOG is missing",
+		);
+		if ( changelog and meta != null and meta.exists("version") ) {
+			let text := "";
+			for ( let name in [ "CHANGELOG.md", "CHANGELOG.txt", "CHANGELOG.pod", "CHANGELOG" ] ) {
+				let file := root.child(name);
+				text := file.slurp_utf8() if file.is_file();
+			}
+			_check(
+				checks,
+				"changelog-version",
+				contains( text, "" _ meta{version} ) ? "pass" : "warn",
+				contains( text, "" _ meta{version} ) ? "CHANGELOG mentions current version" : "CHANGELOG does not mention current version",
+			);
+		}
+		_check( checks, "licence", licence ? "pass" : "warn", licence ? "licence file exists" : "licence file is missing" );
+
+		let tests := _walk_tests(root);
+		_check(
+			checks,
+			"tests-present",
+			tests.length() > 0 ? "pass" : "warn",
+			tests.length() > 0 ? "tests are present" : "no tests found",
+		);
+
+		let total_size := 0;
+		for ( let file in plan{files} ) {
+			total_size += _path_child( root, file ).size();
+		}
+		let max_bytes := _opt( options, "max-bytes", DEFAULT_MAX_BYTES );
+		_check(
+			checks,
+			"package-size",
+			total_size <= max_bytes ? "pass" : "warn",
+			"package candidate is " _ _size_human(total_size),
+		);
+
+		let summary := _summarize_checks(checks);
+		let strict := _has( options, "strict" );
+		if ( strict and summary{warnings} > 0 ) {
+			summary{failures} += summary{warnings};
+		}
+		return {
+			ok: summary{failures} == 0,
+			checks: checks,
+			summary: summary,
+			files: plan{files},
+			excluded: plan{excluded},
+			disallowed: plan{disallowed},
+		};
+	}
+
+	method test ( dir, options? ) {
+		let root := _root_for(dir);
+		let tests := _walk_tests(root);
+		let results := [];
+		let extra := _opt( options, "extra_args", [] );
+		for ( let test in tests ) {
+			let argv := _include_args(root);
+			for ( let arg in extra ) {
+				argv.push(arg);
+			}
+			argv.push(test);
+			let run_result := Proc.run(
+				self._zuzu_command(),
+				argv,
+				{
+					cwd: root.to_String(),
+					capture_stdout: true,
+					capture_stderr: true,
+				},
+			);
+			let parsed := parse_tap(run_result{stdout});
+			results.push({
+				test: test,
+				ok: _test_ok( parsed, run_result ),
+				status: Proc.status_text(run_result),
+				stdout: run_result{stdout},
+				stderr: run_result{stderr},
+				tap: parsed,
+			});
+		}
+		let ok := true;
+		for ( let result in results ) {
+			ok := false if not result{ok};
+		}
+		return {
+			ok: ok,
+			tests: results,
+			count: tests.length(),
+		};
+	}
+
+	method build ( dir, options? ) {
+		let root := _root_for(dir);
+		let warnings := [];
+		let verify_result := null;
+		if ( not _has( options, "skip-verify" ) ) {
+			verify_result := self.verify( root.to_String(), options );
+			if ( not verify_result{ok} ) {
+				return {
+					ok: false,
+					error: "verify failed",
+					verify: verify_result,
+				};
+			}
+		}
+		else {
+			warnings.push("built without running verify");
+		}
+
+		let test_result := null;
+		if ( not _has( options, "no-test" ) ) {
+			test_result := self.test( root.to_String(), options );
+			if ( not test_result{ok} ) {
+				return {
+					ok: false,
+					error: "tests failed",
+					verify: verify_result,
+					tests: test_result,
+				};
+			}
+		}
+		else {
+			warnings.push("built without running tests");
+		}
+
+		let meta := _read_metadata(root);
+		let identifier := _metadata_identifier(meta);
+		let plan := _package_plan(root);
+		let output := _opt( options, "output", identifier _ ".tar.gz" );
+		let out_path := new Path(output);
+		if (
+			( out_path.is_file() or out_path.is_dir() )
+			and not _has( options, "force" )
+			and not _has( options, "dry-run" )
+		) {
+			return {
+				ok: false,
+				error: "archive already exists",
+				archive: out_path.to_String(),
+			};
+		}
+
+		let archive_entries := [];
+		for ( let relative in plan{files} ) {
+			archive_entries.push({
+				path: identifier _ "/" _ relative,
+				data_from: _path_child( root, relative ),
+			});
+		}
+
+		if ( _has( options, "dry-run" ) ) {
+			return {
+				ok: true,
+				dry_run: true,
+				identifier: identifier,
+				archive: out_path.to_String(),
+				file_count: archive_entries.length(),
+				files: plan{files},
+				excluded: plan{excluded},
+				warnings: warnings,
+			};
+		}
+
+		Archive.dump(
+			out_path,
+			{ entries: archive_entries },
+			"tar.gz",
+		);
+
+		return {
+			ok: true,
+			identifier: identifier,
+			archive: out_path.to_String(),
+			size_bytes: out_path.size(),
+			file_count: archive_entries.length(),
+			files: plan{files},
+			excluded: plan{excluded},
+			warnings: warnings,
+			verify: verify_result,
+			tests: test_result,
+		};
+	}
+
+	method upload ( archive_path, options? ) {
+		let archive := new Path("" _ archive_path);
+		if ( not archive.is_file() ) {
+			return { ok: false, error: "archive not found" };
+		}
+		let identity := null;
+		try {
+			identity := _archive_identity(archive);
+		}
+		catch ( Exception e ) {
+			return {
+				ok: false,
+				error: "archive precheck failed: " _ e{message},
+			};
+		}
+		let work_dir := _find_working_copy_for_archive(archive);
+		if ( work_dir != null and not _has( options, "no-precheck" ) ) {
+			let verify_result := self.verify( work_dir.to_String(), options );
+			if ( not verify_result{ok} ) {
+				return {
+					ok: false,
+					error: "working copy verify failed",
+					verify: verify_result,
+				};
+			}
+			if ( not _has( options, "no-test" ) ) {
+				let test_result := self.test( work_dir.to_String(), options );
+				if ( not test_result{ok} ) {
+					return {
+						ok: false,
+						error: "working copy tests failed",
+						tests: test_result,
+					};
+				}
+			}
+		}
+		let base_url := _opt( options, "base-url", Env.get( "ZUZUBOX_BASE_URL", "https://zuzulang.org" ) );
+		if ( not starts_with( base_url, "https://" ) and not _has( options, "insecure" ) ) {
+			return { ok: false, error: "refusing to send token to a non-HTTPS URL" };
+		}
+		let target := base_url _ "/api/v1/distributions";
+		if ( _has( options, "dry-run" ) ) {
+			return {
+				ok: true,
+				dry_run: true,
+				archive: archive.to_String(),
+				identifier: identity{identifier},
+				url: target,
+				message: "dry run; no upload token read and no request sent",
+			};
+		}
+		let token := Env.get("ZUZUBOX_UPLOAD_TOKEN", "");
+		if ( token eq "" and _opt( options, "token-file", null ) != null ) {
+			token := trim(( new Path(_opt( options, "token-file" )) ).slurp_utf8());
+		}
+		if ( token eq "" ) {
+			return {
+				ok: false,
+				auth_error: true,
+				error: "set ZUZUBOX_UPLOAD_TOKEN or pass --token-file",
+			};
+		}
+		if ( not _has( options, "yes" ) and _has( options, "json" ) ) {
+			return {
+				ok: false,
+				error: "upload confirmation required; pass --yes for non-interactive upload",
+			};
+		}
+		if ( not _confirmed_upload( archive, target, identity, options ) ) {
+			return {
+				ok: false,
+				error: "upload declined; pass --yes to skip the confirmation prompt",
+			};
+		}
+		_upload_progress(
+			"upload: sending " _ archive.basename() _ " (" _
+			_size_human(archive.size()) _ ") to " _ target,
+			options,
+		);
+		let multipart := _multipart_archive_file(archive);
+		let ua := new UserAgent( agent: "zuzubox/" _ ZUZUBOX_VERSION );
+		let req := ua
+			.build_request( "POST", target )
+			.auth_bearer(token)
+			.header(
+				"Content-Type",
+				"multipart/form-data; boundary=" _ multipart{boundary},
+			)
+			.upload_from(multipart{path}.to_String());
+		let response := null;
+		try {
+			response := req.send(ua);
+		}
+		catch ( Exception e ) {
+			try {
+				multipart{path}.remove();
+			}
+			catch {
+			}
+			return {
+				ok: false,
+				error: "network error while uploading: " _ e{message},
+			};
+		}
+		multipart{path}.remove();
+		_upload_progress(
+			"upload: server responded with HTTP " _ response.status(),
+			options,
+		);
+		let body := response.content();
+		let parsed := null;
+		try {
+			parsed := body instanceof BinaryString
+				? ( new JSON() ).decode_binarystring(body)
+				: ( new JSON() ).decode("" _ body);
+		}
+		catch {
+			parsed := {
+				ok: false,
+				error: "server returned non-JSON response",
+			};
+		}
+		parsed{status} := response.status();
+		if (
+			response.status() == 401
+			or parsed.get( "code", "" ) eq "auth_required"
+			or parsed.get( "code", "" ) eq "invalid_token"
+		) {
+			parsed{auth_error} := true;
+		}
+		return parsed;
+	}
+}
+
+function _usage ( command := null ) {
+	if ( command eq "mint" ) {
+		return join( "\n", [
+			"Usage: zuzubox mint [options] [DIR]",
+			"",
+			"Creates a new ZDF-1 distribution skeleton.",
+			"",
+			"Options:",
+			"  --module NAME      primary module name, such as colour/palette",
+			"  --name NAME        distribution name, such as colour-palette",
+			"  --licence EXPR     suggested name or any SPDX expression",
+			"  --license EXPR     alias for --licence",
+			"  --no-licence-text  write a placeholder LICENCE file",
+		] ) _ "\n";
+	}
+	if ( command eq "verify" ) {
+		return join( "\n", [
+			"Usage: zuzubox verify [options] [DIR]",
+			"",
+			"Checks metadata, package layout, parseability, and archive size.",
+			"",
+			"Options:",
+			"  --json             print a machine-readable report",
+			"  --max-bytes N      override the archive size limit",
+			"  --quiet, -q        suppress human progress output",
+		] ) _ "\n";
+	}
+	if ( command eq "test" ) {
+		return join( "\n", [
+			"Usage: zuzubox test [options] [DIR] [-- extra zuzu args]",
+			"",
+			"Runs distribution tests with the packaged modules and inc/ path.",
+			"",
+			"Options:",
+			"  --zuzu PATH        ZuzuScript command to run",
+			"  --jobs N           accepted for forward compatibility; default 1",
+			"  --json             print a machine-readable report",
+		] ) _ "\n";
+	}
+	if ( command eq "build" ) {
+		return join( "\n", [
+			"Usage: zuzubox build [options] [DIR]",
+			"",
+			"Verifies, tests, and writes a ZDF-1 tar.gz archive.",
+			"",
+			"Options:",
+			"  --output PATH      archive output path",
+			"  --force            overwrite an existing archive",
+			"  --dry-run          show the package plan without writing",
+			"  --no-test          skip tests after verification",
+			"  --skip-verify      skip verification",
+		] ) _ "\n";
+	}
+	if ( command eq "upload" ) {
+		return join( "\n", [
+			"Usage: zuzubox upload [options] [ARCHIVE]",
+			"",
+			"Uploads an archive using a Zuzulang.org upload token.",
+			"",
+			"Options:",
+			"  --base-url URL     server base URL",
+			"  --token-file PATH  read the bearer token from a file",
+			"  --yes, -y          skip confirmation prompts",
+			"  --dry-run          run checks without uploading",
+			"  --no-precheck      skip working-copy verification",
+			"  --insecure         allow a non-HTTPS base URL",
+		] ) _ "\n";
+	}
+	return join( "\n", [
+		"Usage:",
+		"  zuzubox mint [options] [DIR]",
+		"  zuzubox verify [options] [DIR]",
+		"  zuzubox test [options] [DIR] [-- extra zuzu args]",
+		"  zuzubox build [options] [DIR]",
+		"  zuzubox upload [options] [ARCHIVE]",
+		"  zuzubox help [COMMAND]",
+		"  zuzubox version",
+		"",
+		"Global options:",
+		"  --help, -h         show help",
+		"  --version          show version",
+		"  --quiet, -q        suppress progress output",
+		"  --json             print JSON where supported",
+		"  --colour WHEN      auto, always, or never",
+		"  --no-colour        disable colour",
+		"  --ascii            use ASCII status markers",
+		"  --yes, -y          assume yes for prompts",
+		"  --licence NAME     suggested names or any SPDX expression for mint",
+	] ) _ "\n";
+}
+
+function _dir_arg ( args ) {
+	return args.length() == 0 ? "." : args[0];
+}
+
+function _upload_archive_arg ( args ) {
+	return args[0] if args.length() > 0;
+
+	let root := new Path(".");
+	let candidates := [];
+	for ( let child in root.children() ) {
+		if ( child.is_file() and ends_with( child.basename(), ".tar.gz" ) ) {
+			candidates.push(child);
+		}
+	}
+	if ( candidates.length() == 0 ) {
+		die "no .tar.gz archive found; pass ARCHIVE";
+	}
+
+	let preferred := [];
+	let metadata := null;
+	try {
+		metadata := _read_metadata(root);
+	}
+	catch {
+		metadata := null;
+	}
+	if ( metadata instanceof Dict or metadata instanceof PairList ) {
+		let expected := _metadata_identifier(metadata) _ ".tar.gz";
+		for ( let candidate in candidates ) {
+			preferred.push(candidate) if candidate.basename() eq expected;
+		}
+	}
+	if ( preferred.length() == 1 ) {
+		return preferred[0].to_String();
+	}
+	if ( preferred.length() > 1 ) {
+		die "multiple matching .tar.gz archives found; pass ARCHIVE";
+	}
+	if ( candidates.length() == 1 ) {
+		return candidates[0].to_String();
+	}
+	die "multiple .tar.gz archives found; pass ARCHIVE";
+}
+
+function _split_at_double_dash ( argv ) {
+	let before := [];
+	let after := [];
+	let seen := false;
+	for ( let arg in argv ) {
+		if ( not seen and "" _ arg eq "--" ) {
+			seen := true;
+			next;
+		}
+		if ( seen ) {
+			after.push(arg);
+		}
+		else {
+			before.push(arg);
+		}
+	}
+	return {
+		before: before,
+		after: after,
+	};
+}
+
+function _parse ( argv ) {
+	return Getopt.parse(
+		argv,
+		[
+			"help|h",
+			"version",
+			"quiet|q",
+			"verbose|v",
+			"json",
+			"colour=s",
+			"color=s",
+			"no-colour",
+			"no-color",
+			"ascii",
+			"yes|y",
+			"strict",
+			"max-bytes=i",
+			"jobs=i",
+			"no-test",
+			"skip-verify",
+			"dry-run",
+			"output|o=s",
+			"force",
+			"module=s",
+			"name=s",
+			"licence=s",
+			"license=s",
+			"token-file=s",
+			"base-url=s",
+			"insecure",
+			"no-precheck",
+		],
+	);
+}
+
+function _print_verify ( result, options ) {
+	if ( _has( options, "json" ) ) {
+		STDOUT.print(_plain_json(result));
+		return true;
+	}
+	for ( let check in result{checks} ) {
+		_status_line( check, options );
+	}
+	STDOUT.say(
+		_paint(
+			_summary_text( "verify", result{summary} ),
+			result{ok} ? "green" : "red",
+			options,
+		)
+	);
+	return true;
+}
+
+function _print_test ( result, options ) {
+	if ( _has( options, "json" ) ) {
+		STDOUT.print(_plain_json(result));
+		return true;
+	}
+	for ( let test in result{tests} ) {
+		if ( test{ok} ) {
+			STDOUT.say(_paint( _marker( "pass", options ), "green", options ) _ " " _ test{test})
+				if not _has( options, "quiet" );
+		}
+		else {
+			STDOUT.say(_paint( _marker( "fail", options ), "red", options ) _ " " _ test{test} _ " failed");
+			STDOUT.print(test{stdout}) if test{stdout} ne "";
+			STDERR.print(test{stderr}) if test{stderr} ne "";
+		}
+	}
+	let summary := {
+		passed: result{tests}.grep( fn r -> r{ok} ).length(),
+		warnings: 0,
+		failures: result{tests}.grep( fn r -> not r{ok} ).length(),
+	};
+	STDOUT.say(_paint( _summary_text( "test", summary ), result{ok} ? "green" : "red", options ));
+	return true;
+}
+
+function _print_build ( result, options ) {
+	if ( _has( options, "json" ) ) {
+		STDOUT.print(_plain_json(result));
+		return true;
+	}
+	if ( not result{ok} ) {
+		STDERR.say("build: " _ result{error});
+		return true;
+	}
+	if ( result.get( "dry_run", false ) ) {
+		STDOUT.say("build: dry run for " _ result{identifier});
+	}
+	else {
+		STDOUT.say(
+			_paint( "build: wrote " _ result{archive}, "green", options ) _
+			" (" _ _size_human(result{size_bytes}) _ ", " _
+			result{file_count} _ " files)"
+		);
+	}
+	if ( result.exists("warnings") ) {
+		for ( let warning in result{warnings} ) {
+			STDERR.say("build: warning: " _ warning);
+		}
+	}
+	if ( _has( options, "verbose" ) or result.get( "dry_run", false ) ) {
+		for ( let file in result{files} ) {
+			STDOUT.say("  + " _ file);
+		}
+		for ( let ignored in result{excluded} ) {
+			STDOUT.say("  - " _ ignored{path} _ " (" _ ignored{reason} _ ")");
+		}
+	}
+	return true;
+}
+
+function _print_mint ( result, options ) {
+	if ( _has( options, "json" ) ) {
+		STDOUT.print(_plain_json(result));
+		return true;
+	}
+	STDOUT.say(_paint( "mint: created " _ result{dir}, "green", options ));
+	for ( let file in result{files} ) {
+		STDOUT.say("  " _ _paint( file, "cyan", options ));
+	}
+	STDOUT.say("next: edit metadata, then run zuzubox verify");
+	return true;
+}
+
+function _print_upload ( result, options ) {
+	if ( _has( options, "json" ) ) {
+		STDOUT.print(_plain_json(result));
+		return true;
+	}
+	if ( result{ok} ) {
+		if ( result.get( "dry_run", false ) ) {
+			STDOUT.say("upload: dry run for " _ result{identifier} _ " to " _ result{url});
+		}
+		else {
+			STDOUT.say(_paint( "upload: accepted " _ result.get( "identifier", "" ), "green", options ));
+			STDOUT.say(result{url}) if result.exists("url");
+		}
+	}
+	else {
+		STDERR.say("upload: " _ result.get( "error", "failed" ));
+	}
+	return true;
+}
+
+function _tail ( values ) {
+	let out := [];
+	let i := 1;
+	while ( i < values.length() ) {
+		out.push(values[i]);
+		i++;
+	}
+	return out;
+}
+
+function run_cli ( argv ) {
+	let split_argv := _split_at_double_dash(argv);
+	let parsed := _parse(split_argv{before});
+	if ( not parsed{ok} ) {
+		STDERR.say(parsed{error});
+		STDERR.print(_usage());
+		return 2;
+	}
+	let options := parsed{options};
+	let args := parsed{argv};
+	if ( _has( options, "version" ) ) {
+		STDOUT.say("zuzubox " _ ZUZUBOX_VERSION);
+		return 0;
+	}
+	if ( _has( options, "help" ) or args.length() == 0 or args[0] eq "help" ) {
+		let help_command := null;
+		if ( args.length() > 0 ) {
+			help_command := args[0] eq "help"
+				? ( args.length() > 1 ? args[1] : null )
+				: args[0];
+		}
+		STDOUT.print(_usage(help_command));
+		return 0;
+	}
+	let command := args[0];
+	let rest := _tail(args);
+	let box := new Zuzubox();
+	try {
+		if ( command eq "mint" ) {
+			let result := box.mint( rest.length() == 0 ? null : rest[0], options );
+			_print_mint( result, options );
+			return 0;
+		}
+		if ( command eq "verify" ) {
+			let result := box.verify( _dir_arg(rest), options );
+			_print_verify( result, options );
+			return result{ok} ? 0 : 1;
+		}
+		if ( command eq "test" ) {
+			options.set( "extra_args", split_argv{after} );
+			let result := box.test( _dir_arg(rest), options );
+			_print_test( result, options );
+			return result{ok} ? 0 : 1;
+		}
+		if ( command eq "build" ) {
+			let result := box.build( _dir_arg(rest), options );
+			_print_build( result, options );
+			return result{ok} ? 0 : 1;
+		}
+		if ( command eq "upload" ) {
+			let result := box.upload( _upload_archive_arg(rest), options );
+			_print_upload( result, options );
+			return result{ok} ? 0 : ( result.get( "auth_error", false ) ? 3 : 1 );
+		}
+	}
+	catch ( Exception e ) {
+		if ( _has( options, "json" ) ) {
+			STDOUT.print(_plain_json({
+				ok: false,
+				error: e{message},
+			}));
+		}
+		else {
+			STDERR.say("zuzubox: " _ e{message});
+		}
+		return 1;
+	}
+	STDERR.say("Unknown command: " _ command);
+	STDERR.print(_usage());
+	return 2;
+}
