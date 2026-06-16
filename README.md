@@ -1,3 +1,5 @@
+<img src="https://zuzulang.org/img/zuzubox/logo-small.png" alt="()" class="float-end d-none d-lg-block ms-3 mb-3 rounded" />
+
 # zuzubox
 
 `zuzubox` is the authoring companion to `zuzuzoo`. It helps distribution
