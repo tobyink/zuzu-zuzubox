@@ -51,7 +51,7 @@ from std/tui import colour_text, readline, supports_ansi;
 from licence/spdx import is_spdx_expression, licence_expression_text, normalize_spdx_expression;
 from test/parser import parse as parse_tap;
 
-const ZUZUBOX_VERSION := "0.0.1";
+const ZUZUBOX_VERSION := "0.0.2";
 const DEFAULT_MAX_BYTES := 20 * 1024 * 1024;
 const DEFAULT_LICENCE := "Artistic-1.0 OR GPL-2.0-or-later";
 
